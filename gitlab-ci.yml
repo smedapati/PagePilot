@@ -1,0 +1,79 @@
+# Publishes Markdown under docs/ to Confluence.
+#
+# Required CI/CD variables (Settings > CI/CD > Variables, mark the token Masked + Protected):
+#   CONFLUENCE_BASE_URL        Cloud: https://yourco.atlassian.net/wiki   DC: https://confluence.yourco.com
+#   CONFLUENCE_API_TOKEN       Cloud: API token   DC: Personal Access Token
+#   CONFLUENCE_SPACE_KEY       e.g. ENG
+# Optional:
+#   CONFLUENCE_USER            Cloud only: the Atlassian account email that owns the token
+#   CONFLUENCE_PARENT_PAGE_ID  publish under this page instead of the space root
+#   CONFLUENCE_TITLE_PREFIX    e.g. "[Payments] " to keep titles unique across repos
+#   CONFLUENCE_CA_BUNDLE       path to your corporate CA bundle for self-hosted Confluence
+#   SYNC_PRUNE=true            delete pages whose .md file was removed
+#   SYNC_EXCLUDE               comma-separated globs, e.g. "drafts/*,*.internal.md"
+
+stages:
+  - validate
+  - publish
+
+variables:
+  DOCS_DIR: docs
+  SYNC_SCRIPT_DIR: ci/confluence-sync
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+.confluence_sync:
+  image: python:3.12-slim
+  cache:
+    key: confluence-sync-pip
+    paths: [.cache/pip]
+  before_script:
+    - pip install --quiet -r "$SYNC_SCRIPT_DIR/requirements.txt"
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths: [confluence-sync-report.json]
+
+# Merge requests: convert every page locally (no network, no secrets needed),
+# then show what would change in Confluence if the variables are available.
+docs:validate:
+  extends: .confluence_sync
+  stage: validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - "$DOCS_DIR/**/*"
+        - "$SYNC_SCRIPT_DIR/**/*"
+  script:
+    - python "$SYNC_SCRIPT_DIR/confluence_sync.py" --validate-only --strict
+    - |
+      if [ -n "$CONFLUENCE_API_TOKEN" ]; then
+        python "$SYNC_SCRIPT_DIR/confluence_sync.py" --dry-run --report confluence-sync-report.json
+      else
+        echo "Confluence token not available to MR pipelines; skipping dry run."
+      fi
+
+# Default branch: publish. Only one publish job runs at a time to avoid
+# two pipelines racing on the same pages.
+docs:publish:
+  extends: .confluence_sync
+  stage: publish
+  resource_group: confluence-publish
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - "$DOCS_DIR/**/*"
+        - "$SYNC_SCRIPT_DIR/**/*"
+    - if: $CI_PIPELINE_SOURCE == "web"          # manual "Run pipeline"
+    - if: $CI_PIPELINE_SOURCE == "schedule"     # optional nightly drift fix
+  script:
+    - python "$SYNC_SCRIPT_DIR/confluence_sync.py" --report confluence-sync-report.json
+
+# Unit tests for the sync script itself.
+docs:sync-tests:
+  extends: .confluence_sync
+  stage: validate
+  rules:
+    - changes: ["$SYNC_SCRIPT_DIR/**/*"]
+  script:
+    - pip install --quiet pytest
+    - pytest -q "$SYNC_SCRIPT_DIR/tests"
